@@ -1,0 +1,4 @@
+// The exe icon comes first (lowest ID), so Explorer shows it.
+1 ICON "app.ico"
+2 ICON "tray-dark.ico"
+3 ICON "tray-light.ico"

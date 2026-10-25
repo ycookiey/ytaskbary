@@ -27,11 +27,12 @@ use windows::Win32::Foundation::{
     POINT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::System::Threading::{CreateEventW, CreateMutexW, INFINITE};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LWIN, VK_RWIN};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -41,6 +42,9 @@ const ID_ENABLED: usize = 1;
 const ID_AUTOSTART: usize = 2;
 const ID_EXIT: usize = 3;
 const OBJID_WINDOW: i32 = 0;
+/// Icon resource IDs in assets/app.rc (1 is the exe icon).
+const IDI_TRAY_DARK: u16 = 2;
+const IDI_TRAY_LIGHT: u16 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -63,6 +67,8 @@ struct App {
     tap: WinTap,
     games: Option<game::GameList>,
     rehides: u64,
+    /// The icon shown in the tray; destroyed when replaced.
+    tray_icon: HICON,
 }
 
 thread_local! {
@@ -106,6 +112,7 @@ fn main() {
             tap: WinTap::default(),
             games,
             rehides: 0,
+            tray_icon: HICON::default(),
         })
     });
     log::write(match mode {
@@ -409,6 +416,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_SETTINGCHANGE => {
+            // The color settings changed, possibly the taskbar's light or dark theme.
+            if lparam.0 != 0 && PCWSTR(lparam.0 as *const u16).to_string().is_ok_and(|s| s == "ImmersiveColorSet") {
+                update_tray_icon(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 taskbar::show_all();
@@ -453,18 +467,81 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
     NOTIFYICONDATAW { cbSize: mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
 }
 
+/// The taskbar uses the light theme. Read from
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize`; dark
+/// when the value is missing.
+fn light_taskbar() -> bool {
+    let mut value = 0u32;
+    let mut size = mem::size_of::<u32>() as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+        .is_ok()
+    };
+    ok && value == 1
+}
+
+/// Loads the tray icon that fits the taskbar theme, at the small icon size.
+fn load_tray_icon() -> HICON {
+    let id = if light_taskbar() { IDI_TRAY_LIGHT } else { IDI_TRAY_DARK };
+    unsafe {
+        let Ok(instance) = GetModuleHandleW(None) else { return HICON::default() };
+        LoadImageW(
+            HINSTANCE::from(instance),
+            PCWSTR(id as usize as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            IMAGE_FLAGS(0),
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
+    }
+}
+
+/// Keeps `icon` as the tray icon and destroys the one it replaces.
+fn replace_tray_icon(icon: HICON) {
+    let old = with_app(|a| mem::replace(&mut a.tray_icon, icon)).unwrap_or_default();
+    if !old.is_invalid() && old != icon {
+        unsafe {
+            let _ = DestroyIcon(old);
+        }
+    }
+}
+
 fn add_tray_icon(hwnd: HWND) {
     let mut nid = notify_data(hwnd);
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
-    // TODO: embed an icon of its own; the generic application icon is used for now.
-    nid.hIcon = unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() };
+    nid.hIcon = load_tray_icon();
     let tip = win::wide("ytaskbary");
     let len = tip.len().min(nid.szTip.len());
     nid.szTip[..len].copy_from_slice(&tip[..len]);
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
     }
+    replace_tray_icon(nid.hIcon);
+}
+
+/// Swaps the tray icon after the taskbar theme changed.
+fn update_tray_icon(hwnd: HWND) {
+    let mut nid = notify_data(hwnd);
+    nid.uFlags = NIF_ICON;
+    nid.hIcon = load_tray_icon();
+    if nid.hIcon.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+    replace_tray_icon(nid.hIcon);
 }
 
 fn remove_tray_icon(hwnd: HWND) {
@@ -472,6 +549,7 @@ fn remove_tray_icon(hwnd: HWND) {
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     }
+    replace_tray_icon(HICON::default());
 }
 
 fn show_menu(hwnd: HWND) {
