@@ -1,6 +1,6 @@
 [package]
 name = "ytaskbary"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Keeps the Windows 11 taskbar hidden and shows it only while the Start menu is open"
 license = "MIT"
